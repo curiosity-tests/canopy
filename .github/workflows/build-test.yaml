@@ -1,5 +1,33 @@
 name: Test
+
+# racecar fork-testbed patch. Changes from upstream:
+#   1. workflow_dispatch with a `leg` input, so racecar can trigger a run and
+#      choose baseline vs instrumented. Upstream only fires on push/PR with a
+#      paths filter, which racecar cannot drive.
+#   2. permissions block: id-token: write is required by setup-chalk-action's
+#      OIDC connect. NOTE this also zeroes every unlisted scope, so contents:
+#      read is restated for actions/checkout.
+#   3. The Set up Chalk step, which installs chalk, resolves the workspace
+#      profile, and (when the profile enables build observables) installs
+#      curiosity and exports LD_PRELOAD=co-monitor via $GITHUB_ENV. Everything
+#      after it is instrumented with no edit to those steps.
+#   4. A fail-closed assertion: the action defaults to best-effort, and an
+#      uninstrumented run labelled "instrumented" is a corrupt data point rather
+#      than a degraded one.
+# Build and test steps themselves are byte-identical to upstream.
+
 on:
+  workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
   pull_request:
     branches: "*"
     paths:
@@ -15,6 +43,13 @@ on:
       - "go.mod"
       - "go.sum"
       - ".github/workflows/**"
+
+run-name: "Test ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
+
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   build:
     name: Build
@@ -26,8 +61,29 @@ jobs:
           go-version: 1.26
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up Chalk
+        if: inputs.leg != 'baseline'
+        uses: crashappsec/setup-chalk-action@main
+        with:
+          connect: true
+          observables_continue_on_error: false
+        env:
+          CURIOSITY_STRICT: "1"
+          REDBOX_BEACON_DISABLED: "1"
+
+      - name: Assert instrumentation is live
+        if: inputs.leg != 'baseline'
+        run: |
+          echo "LD_PRELOAD=${LD_PRELOAD:-<unset>}"
+          echo "CURIOSITY_HOME=${CURIOSITY_HOME:-<unset>}"
+          echo "CURIOSITY_SOCKET_NAME=${CURIOSITY_SOCKET_NAME:-<unset>}"
+          command -v chalk >/dev/null && chalk version || echo "chalk not on PATH"
+          test -n "${LD_PRELOAD:-}" || { echo "::error::LD_PRELOAD unset - build would run uninstrumented"; exit 1; }
+
       - name: Build Services
         run: make build/canopy-full
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -38,6 +94,25 @@ jobs:
           go-version: 1.26
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up Chalk
+        if: inputs.leg != 'baseline'
+        uses: crashappsec/setup-chalk-action@main
+        with:
+          connect: true
+          observables_continue_on_error: false
+        env:
+          CURIOSITY_STRICT: "1"
+          REDBOX_BEACON_DISABLED: "1"
+
+      - name: Assert instrumentation is live
+        if: inputs.leg != 'baseline'
+        run: |
+          test -n "${LD_PRELOAD:-}" || { echo "::error::LD_PRELOAD unset - tests would run uninstrumented"; exit 1; }
+
+      # Upstream caches the Go build. Left in place for this first verification
+      # run; it must be disabled before any timing comparison, or we would be
+      # measuring cache-hit rate rather than instrumentation overhead.
       - name: Set up cache
         uses: actions/cache@v4
         with:
@@ -47,5 +122,6 @@ jobs:
           key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-go-
+
       - name: Run Unit tests
         run: make build/canopy-full && go test $(go list ./... | grep -v cmd/auto-update)
