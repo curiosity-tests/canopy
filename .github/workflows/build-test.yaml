@@ -76,7 +76,9 @@ jobs:
       # clears LD_PRELOAD once it has injected, so that it does not cascade into
       # every child process. An empty LD_PRELOAD is therefore what SUCCESS looks
       # like from inside the shell, and testing it gives a false negative on
-      # every instrumented run.
+      # every instrumented run. Process name is no good either -- co-hostd
+      # daemonizes and pgrep does not find it. Socket existence is the signal
+      # curiosity's own CI gates on, so it is the one we use.
       - name: Assert instrumentation is live
         if: inputs.leg != 'baseline'
         run: |
@@ -85,7 +87,6 @@ jobs:
           command -v chalk >/dev/null && chalk version || echo "chalk not on PATH"
           test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
           test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent - build would run uninstrumented"; exit 1; }
-          pgrep -a co-hostd || { echo "::error::co-hostd not running"; exit 1; }
 
       - name: Build Services
         run: make build/canopy-full
