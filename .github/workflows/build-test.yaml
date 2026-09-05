@@ -4,17 +4,14 @@ name: Test
 #   1. workflow_dispatch with a `leg` input, so racecar can trigger a run and
 #      choose baseline vs instrumented. Upstream only fires on push/PR with a
 #      paths filter, which racecar cannot drive.
-#   2. permissions block: id-token: write is required by setup-chalk-action's
-#      OIDC connect. NOTE this also zeroes every unlisted scope, so contents:
-#      read is restated for actions/checkout.
-#   3. The Set up Chalk step, which installs chalk, resolves the workspace
-#      profile, and (when the profile enables build observables) installs
-#      curiosity and exports LD_PRELOAD=co-monitor via $GITHUB_ENV. Everything
-#      after it is instrumented with no edit to those steps.
-#   4. A fail-closed assertion: the action defaults to best-effort, and an
-#      uninstrumented run labelled "instrumented" is a corrupt data point rather
-#      than a degraded one.
-# Build and test steps themselves are byte-identical to upstream.
+#   2. actions/checkout -> crashappsec/action-checkout, which wraps checkout and
+#      setup-chalk-action together (the internal pattern, cf. dummy-deployments).
+#      `chalk:` is the single variable separating the two arms, and `profile:`
+#      selects the observables profile.
+#   3. permissions: id-token: write for the action's OIDC connect. Declaring the
+#      block also zeroes every unlisted scope, so contents: read is restated.
+#   4. A fail-closed assertion on the instrumented arm.
+# Build and test COMMANDS are byte-identical to upstream.
 
 on:
   workflow_dispatch:
@@ -24,6 +21,10 @@ on:
         type: choice
         options: [instrumented, baseline]
         default: instrumented
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
       racecar_run:
         description: "racecar correlation token, echoed into the run name"
         type: string
@@ -50,6 +51,12 @@ permissions:
   contents: read
   id-token: write
 
+env:
+  # The one variable that separates the arms. On baseline, action-checkout skips
+  # its Set up Chalk step entirely: no chalk, no curiosity, no LD_PRELOAD, no
+  # residue to argue about.
+  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+
 jobs:
   build:
     name: Build
@@ -59,28 +66,27 @@ jobs:
         uses: actions/setup-go@v4
         with:
           go-version: 1.26
-      - name: Checkout code
-        uses: actions/checkout@v4
 
-      - name: Set up Chalk
-        if: inputs.leg != 'baseline'
-        uses: crashappsec/setup-chalk-action@main
+      - name: Checkout code
+        uses: crashappsec/action-checkout@main
         with:
-          connect: true
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          # Default is best-effort; a silently-uninstrumented run is a corrupt
+          # data point rather than a degraded one, so fail closed.
           observables_continue_on_error: false
-        env:
-          CURIOSITY_STRICT: "1"
-          REDBOX_BEACON_DISABLED: "1"
+          # Upstream used actions/checkout, which does not fetch LFS. Keep the
+          # tree identical to what upstream CI builds.
+          lfs: false
 
       # Assert on the host-server socket, NOT on LD_PRELOAD: co-monitor's loader
-      # clears LD_PRELOAD once it has injected, so that it does not cascade into
-      # every child process. An empty LD_PRELOAD is therefore what SUCCESS looks
-      # like from inside the shell, and testing it gives a false negative on
-      # every instrumented run. Process name is no good either -- co-hostd
-      # daemonizes and pgrep does not find it. Socket existence is the signal
-      # curiosity's own CI gates on, so it is the one we use.
+      # clears LD_PRELOAD once it has injected so it does not cascade into every
+      # child, which means an empty LD_PRELOAD is what SUCCESS looks like from
+      # inside the shell. Process name is no good either -- co-hostd daemonizes
+      # and pgrep does not match it. Socket existence is the signal curiosity's
+      # own CI gates on.
       - name: Assert instrumentation is live
-        if: inputs.leg != 'baseline'
+        if: env.CHALK_ON == 'true'
         run: |
           echo "CURIOSITY_ROOT=${CURIOSITY_ROOT:-<unset>}"
           echo "CURIOSITY_SOCKET_NAME=${CURIOSITY_SOCKET_NAME:-<unset>}"
@@ -99,28 +105,24 @@ jobs:
         uses: actions/setup-go@v4
         with:
           go-version: 1.26
-      - name: Checkout code
-        uses: actions/checkout@v4
 
-      - name: Set up Chalk
-        if: inputs.leg != 'baseline'
-        uses: crashappsec/setup-chalk-action@main
+      - name: Checkout code
+        uses: crashappsec/action-checkout@main
         with:
-          connect: true
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
           observables_continue_on_error: false
-        env:
-          CURIOSITY_STRICT: "1"
-          REDBOX_BEACON_DISABLED: "1"
+          lfs: false
 
       - name: Assert instrumentation is live
-        if: inputs.leg != 'baseline'
+        if: env.CHALK_ON == 'true'
         run: |
           test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
           test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
 
-      # Upstream caches the Go build. Left in place for this first verification
-      # run; it must be disabled before any timing comparison, or we would be
-      # measuring cache-hit rate rather than instrumentation overhead.
+      # Upstream caches the Go build. Left in place for this verification run; it
+      # must be disabled before any timing comparison, or we would be measuring
+      # cache-hit rate rather than instrumentation overhead.
       - name: Set up cache
         uses: actions/cache@v4
         with:
