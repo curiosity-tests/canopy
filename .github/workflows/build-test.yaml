@@ -72,14 +72,20 @@ jobs:
           CURIOSITY_STRICT: "1"
           REDBOX_BEACON_DISABLED: "1"
 
+      # Assert on the host-server socket, NOT on LD_PRELOAD: co-monitor's loader
+      # clears LD_PRELOAD once it has injected, so that it does not cascade into
+      # every child process. An empty LD_PRELOAD is therefore what SUCCESS looks
+      # like from inside the shell, and testing it gives a false negative on
+      # every instrumented run.
       - name: Assert instrumentation is live
         if: inputs.leg != 'baseline'
         run: |
-          echo "LD_PRELOAD=${LD_PRELOAD:-<unset>}"
-          echo "CURIOSITY_HOME=${CURIOSITY_HOME:-<unset>}"
+          echo "CURIOSITY_ROOT=${CURIOSITY_ROOT:-<unset>}"
           echo "CURIOSITY_SOCKET_NAME=${CURIOSITY_SOCKET_NAME:-<unset>}"
           command -v chalk >/dev/null && chalk version || echo "chalk not on PATH"
-          test -n "${LD_PRELOAD:-}" || { echo "::error::LD_PRELOAD unset - build would run uninstrumented"; exit 1; }
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent - build would run uninstrumented"; exit 1; }
+          pgrep -a co-hostd || { echo "::error::co-hostd not running"; exit 1; }
 
       - name: Build Services
         run: make build/canopy-full
@@ -108,7 +114,8 @@ jobs:
       - name: Assert instrumentation is live
         if: inputs.leg != 'baseline'
         run: |
-          test -n "${LD_PRELOAD:-}" || { echo "::error::LD_PRELOAD unset - tests would run uninstrumented"; exit 1; }
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
 
       # Upstream caches the Go build. Left in place for this first verification
       # run; it must be disabled before any timing comparison, or we would be
